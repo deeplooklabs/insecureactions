@@ -1,5 +1,5 @@
 <p align="center">
-<a href="https://deeplooklabs.com"><img src=".github/images/banner.png" alt=""/></a>
+<a href="https://deeplooklabs.com"><img src=".github/images/banner.png" alt="deeplooklabs"/></a>
 </p>
 
 ### Description
@@ -33,6 +33,18 @@ insecureactions ORGNAME
 ```
 
 The script will iterate through all repositories in the provided organization, checking each workflow file for dangerous patterns and broken links.
+
+### Test
+
+To test check:
+```bash
+insecureactions ghacheck
+```
+
+<p align="center">
+<a href="#"><img src=".github/images/example.png" alt="example"/></a>
+</p>
+
 
 ### Logs
 The script provides colored logs to make it easier to distinguish between informational messages, warnings, and errors.
