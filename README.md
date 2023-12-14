@@ -3,7 +3,7 @@
 </p>
 
 ### Description
-`insecureactions`` is a Python script designed to identify potential security vulnerabilities in GitHub Actions workflows. It scans repositories in a GitHub organization for dangerous patterns such as command injections, unsafe usage of secrets, and checks for broken links that could lead to hijacking attacks.
+`insecureactions` is a Python script designed to identify potential security vulnerabilities in GitHub Actions workflows. It scans repositories in a GitHub organization for dangerous patterns such as command injections, unsafe usage of secrets, and checks for broken links that could lead to hijacking attacks.
 
 ### Prerequisites
 - Python 3.x
