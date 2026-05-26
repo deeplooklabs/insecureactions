@@ -9,26 +9,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
-from colorama import Fore, init
+import sys
+
+from colorama import Back, Fore, Style, init
 
 init(autoreset=True)
 
 
 class CustomFormatter(logging.Formatter):
-    """Colored log formatter."""
+    """Dim formatter for status messages — keeps findings visually dominant."""
 
-    COLORS = {
-        logging.DEBUG: Fore.CYAN,
-        logging.INFO: Fore.GREEN,
+    LEVEL_COLORS = {
+        logging.DEBUG: Style.DIM + Fore.CYAN,
+        logging.INFO: Style.DIM + Fore.WHITE,
         logging.WARNING: Fore.YELLOW,
         logging.ERROR: Fore.RED,
-        logging.CRITICAL: Fore.RED,
+        logging.CRITICAL: Style.BRIGHT + Fore.RED,
     }
 
     def format(self, record):
-        color = self.COLORS.get(record.levelno, "")
-        base = "%(asctime)s - %(levelname)s - %(message)s"
-        return logging.Formatter(color + base + Fore.RESET).format(record)
+        color = self.LEVEL_COLORS.get(record.levelno, "")
+        base = "%(asctime)s %(levelname)-7s %(message)s"
+        return logging.Formatter(color + base + Style.RESET_ALL).format(record)
 
 
 logger = logging.getLogger("insecureactions")
@@ -38,6 +40,87 @@ if not logger.handlers:
     _handler.setFormatter(CustomFormatter())
     logger.addHandler(_handler)
 logger.propagate = False
+
+
+# Severity hierarchy. Order matters for the summary table at end-of-scan.
+SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+
+# Per-tag severity registry. Source of truth for both color and final tally.
+FINDING_SEVERITY = {
+    "pull_request_target+checkout-pr-ref": "CRITICAL",
+    "build-on-untrusted-checkout":         "CRITICAL",
+    "self-hosted+fork-trigger":            "CRITICAL",
+    "compromised-action":                  "CRITICAL",
+    "cve-2025-30066-malicious-pin":        "CRITICAL",
+    "cve-2025-30066-exposed-runs":         "CRITICAL",
+    "cve-2025-30066-confirmed":            "CRITICAL",
+    "script-injection":                    "HIGH",
+    "github-script-injection":             "HIGH",
+    "permissions-write-all":               "HIGH",
+    "secrets-inherit":                     "HIGH",
+    "cve-2025-30066-suspicious":           "HIGH",
+    "no-permissions-block":                "MEDIUM",
+    "pipe-to-shell":                       "MEDIUM",
+    "unpinned-action":                     "MEDIUM",
+    "outdated-action":                     "LOW",
+    "broken-link":                         "LOW",
+    "cve-2025-30066":                      "INFO",
+    "cve-2025-30066-clean":                "INFO",
+}
+
+# Severity → (label paint, tag paint). Critical uses an inverted background so
+# it stays visible even on bright terminals.
+SEVERITY_STYLE = {
+    "CRITICAL": (Back.RED + Fore.WHITE + Style.BRIGHT, Fore.RED + Style.BRIGHT),
+    "HIGH":     (Fore.RED + Style.BRIGHT,              Fore.RED + Style.BRIGHT),
+    "MEDIUM":   (Fore.YELLOW + Style.BRIGHT,           Fore.YELLOW),
+    "LOW":      (Fore.CYAN + Style.BRIGHT,             Fore.CYAN),
+    "INFO":     (Fore.GREEN,                           Fore.GREEN),
+}
+
+# Tally of findings by severity for end-of-scan summary. Thread-safe-ish
+# because Python int increment under the GIL is atomic for our purposes.
+FINDING_COUNTS = {s: 0 for s in SEVERITY_ORDER}
+
+
+def report_finding(tag, location, detail, indent=False):
+    """Emit a single finding with explicit severity column.
+
+    Layout: `HH:MM:SS [SEVERITY] [tag] location -> detail`. Status messages
+    (Scanning…, summaries, rate-limit warnings) keep going through the
+    standard logger so findings stand out visually.
+    """
+    severity = FINDING_SEVERITY.get(tag, "INFO")
+    FINDING_COUNTS[severity] = FINDING_COUNTS.get(severity, 0) + 1
+    label_paint, tag_paint = SEVERITY_STYLE[severity]
+    ts = time.strftime("%H:%M:%S")
+    label = f"{label_paint} {severity:^8} {Style.RESET_ALL}"
+    tag_str = f"{tag_paint}[{tag}]{Style.RESET_ALL}"
+    prefix = "        " if indent else ""
+    print(
+        f"{Style.DIM}{ts}{Style.RESET_ALL} {label} "
+        f"{prefix}{tag_str} {location} -> {detail}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def print_severity_summary():
+    """One-line tally printed at the end of the scan."""
+    if not any(FINDING_COUNTS.values()):
+        print(
+            f"\n{Fore.GREEN}{Style.BRIGHT}No findings.{Style.RESET_ALL}",
+            file=sys.stderr,
+        )
+        return
+    parts = []
+    for sev in SEVERITY_ORDER:
+        count = FINDING_COUNTS[sev]
+        if count == 0:
+            continue
+        label_paint, _ = SEVERITY_STYLE[sev]
+        parts.append(f"{label_paint} {sev}: {count} {Style.RESET_ALL}")
+    print("\nFindings summary:  " + "  ".join(parts), file=sys.stderr)
 
 
 GITHUB_API = "https://api.github.com"
@@ -601,54 +684,60 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
     location = f"{org_name}/{repo_name}:{path}"
 
     for ref in find_malicious_tj_pin(content):
-        logger.error(
-            f"[cve-2025-30066-malicious-pin] {location} -> {ref} "
-            f"(direct pin to the malicious commit; secrets in any run that "
-            f"executed this step are compromised)"
+        report_finding(
+            "cve-2025-30066-malicious-pin",
+            location,
+            f"{ref} (direct pin to the malicious commit; secrets in any "
+            f"run that executed this step are compromised)",
         )
 
     for expr in find_script_injections(content):
-        logger.warning(f"[script-injection] {location} -> {expr}")
+        report_finding("script-injection", location, expr)
 
     if find_pull_request_target_risks(content):
-        logger.error(
-            f"[pull_request_target+checkout-pr-ref] {location} "
-            f"-> attacker-controlled code may run with write token"
+        report_finding(
+            "pull_request_target+checkout-pr-ref",
+            location,
+            "attacker-controlled code may run with write token",
         )
 
     for cmd in find_dangerous_builds_after_checkout(content):
-        logger.error(
-            f"[build-on-untrusted-checkout] {location} -> `{cmd}` runs "
-            f"attacker code after privileged checkout"
+        report_finding(
+            "build-on-untrusted-checkout",
+            location,
+            f"`{cmd}` runs attacker code after privileged checkout",
         )
 
     perm_issue = find_token_permission_issues(content)
     if perm_issue == "missing":
-        logger.warning(
-            f"[no-permissions-block] {location} -> GITHUB_TOKEN inherits repo "
-            f"defaults (often contents: write)"
+        report_finding(
+            "no-permissions-block",
+            location,
+            "GITHUB_TOKEN inherits repo defaults (often contents: write)",
         )
     elif perm_issue == "write-all":
-        logger.error(
-            f"[permissions-write-all] {location} -> GITHUB_TOKEN granted full "
-            f"write scope"
+        report_finding(
+            "permissions-write-all",
+            location,
+            "GITHUB_TOKEN granted full write scope",
         )
 
     if find_self_hosted_with_untrusted_trigger(content):
-        logger.error(
-            f"[self-hosted+fork-trigger] {location} -> self-hosted runner "
-            f"exposed to fork-driven workflow execution"
+        report_finding(
+            "self-hosted+fork-trigger",
+            location,
+            "self-hosted runner exposed to fork-driven workflow execution",
         )
 
     for cmd in find_pipe_to_shell(content):
-        logger.warning(f"[pipe-to-shell] {location} -> {cmd}")
+        report_finding("pipe-to-shell", location, cmd)
 
     for ref in find_outdated_first_party(content):
-        logger.warning(f"[outdated-action] {location} -> {ref}")
+        report_finding("outdated-action", location, ref)
 
     compromised_refs = find_compromised_actions(content)
     for ref, reason in compromised_refs:
-        logger.error(f"[compromised-action] {location} -> {ref} ({reason})")
+        report_finding("compromised-action", location, f"{ref} ({reason})")
 
     # CVE-2025-30066 dynamic audit: list runs of this workflow during the
     # exposure window. Any run that executed during that window with this
@@ -656,24 +745,28 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
     if check_cve_tj and any(
         ref.startswith("tj-actions/changed-files") for ref, _ in compromised_refs
     ):
-        logger.info(
-            f"[cve-2025-30066] {location} -> querying runs in "
-            f"{CVE_2025_30066_DATE_RANGE}…"
+        report_finding(
+            "cve-2025-30066",
+            location,
+            f"querying runs in {CVE_2025_30066_DATE_RANGE}…",
         )
         runs = list_workflow_runs_in_window(
             org_name, repo_name, path, CVE_2025_30066_DATE_RANGE
         )
         if not runs:
-            logger.info(
-                f"[cve-2025-30066-clean] {location} -> no runs executed in "
-                f"the exposure window (the workflow may not have existed yet "
-                f"or simply did not trigger during 2025-03-14..2025-03-15)"
+            report_finding(
+                "cve-2025-30066-clean",
+                location,
+                "no runs executed in the exposure window (the workflow may "
+                "not have existed yet or simply did not trigger during "
+                "2025-03-14..2025-03-15)",
             )
         else:
-            logger.error(
-                f"[cve-2025-30066-exposed-runs] {location} -> "
+            report_finding(
+                "cve-2025-30066-exposed-runs",
+                location,
                 f"{len(runs)} run(s) executed during the exposure window "
-                f"(2025-03-14..2025-03-15); scanning logs for leaked secrets"
+                f"(2025-03-14..2025-03-15); scanning logs for leaked secrets",
             )
 
             scanned = 0
@@ -703,10 +796,16 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
                 else:
                     suspicious += 1
                 for log_name, severity, hint in iocs:
-                    level = logger.error if severity == "confirmed" else logger.warning
-                    level(
-                        f"    [{severity}] run #{run_number} {run_url} "
-                        f"-> {log_name}: {hint}"
+                    sub_tag = (
+                        "cve-2025-30066-confirmed"
+                        if severity == "confirmed"
+                        else "cve-2025-30066-suspicious"
+                    )
+                    report_finding(
+                        sub_tag,
+                        f"run #{run_number} {run_url}",
+                        f"{log_name}: {hint}",
+                        indent=True,
                     )
 
             remaining = len(runs) - CVE_LOG_SCAN_RUN_CAP
@@ -721,20 +820,21 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
             )
 
     if find_secrets_inherit(content):
-        logger.warning(
-            f"[secrets-inherit] {location} -> reusable workflow call receives "
-            f"all caller secrets"
+        report_finding(
+            "secrets-inherit",
+            location,
+            "reusable workflow call receives all caller secrets",
         )
 
     for expr in find_github_script_injections(content):
-        logger.error(f"[github-script-injection] {location} -> {expr}")
+        report_finding("github-script-injection", location, expr)
 
     for ref in find_unpinned_actions(content):
-        logger.warning(f"[unpinned-action] {location} -> {ref}")
+        report_finding("unpinned-action", location, ref)
 
     if check_links:
         for link, status in check_broken_links(content):
-            logger.warning(f"[broken-link] {location} -> {link} ({status})")
+            report_finding("broken-link", location, f"{link} ({status})")
 
 
 def scan_repository(repo, check_links=False, check_cve_tj=False):
@@ -832,3 +932,5 @@ def check(targets, check_links=False, check_cve_tj=False, workers=8):
             exc = future.exception()
             if exc:
                 logger.debug(f"Worker error: {exc}")
+
+    print_severity_summary()
