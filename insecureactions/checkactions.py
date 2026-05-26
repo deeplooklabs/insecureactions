@@ -655,10 +655,20 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
     if check_cve_tj and any(
         ref.startswith("tj-actions/changed-files") for ref, _ in compromised_refs
     ):
+        logger.info(
+            f"[cve-2025-30066] {location} -> querying runs in "
+            f"{CVE_2025_30066_DATE_RANGE}…"
+        )
         runs = list_workflow_runs_in_window(
             org_name, repo_name, path, CVE_2025_30066_DATE_RANGE
         )
-        if runs:
+        if not runs:
+            logger.info(
+                f"[cve-2025-30066-clean] {location} -> no runs executed in "
+                f"the exposure window (the workflow may not have existed yet "
+                f"or simply did not trigger during 2025-03-14..2025-03-15)"
+            )
+        else:
             logger.error(
                 f"[cve-2025-30066-exposed-runs] {location} -> "
                 f"{len(runs)} run(s) executed during the exposure window "
