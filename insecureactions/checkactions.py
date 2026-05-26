@@ -83,7 +83,7 @@ RUN_BLOCK_RE = re.compile(
 )
 INLINE_RUN_RE = re.compile(r"^\s*(?:-\s*)?run\s*:\s*([^\n]+)", re.MULTILINE)
 PR_TARGET_RE = re.compile(
-    r"^\s*on\s*:.*?pull_request_target", re.MULTILINE | re.DOTALL
+    r"^\s*['\"]?on['\"]?\s*:.*?pull_request_target", re.MULTILINE | re.DOTALL
 )
 CHECKOUT_BLOCK_RE = re.compile(
     r"uses\s*:\s*actions/checkout@[^\s]+[\s\S]{0,600}", re.IGNORECASE
@@ -123,13 +123,13 @@ PERMISSIONS_RE = re.compile(r"^\s*permissions\s*:\s*(.*)$", re.MULTILINE)
 WRITE_ALL_RE = re.compile(r"\bwrite-all\b", re.IGNORECASE)
 # Triggers that hand workflow execution to untrusted actors.
 UNTRUSTED_TRIGGERS_RE = re.compile(
-    r"^\s*on\s*:.*?(?:pull_request_target|workflow_run|issue_comment)",
+    r"^\s*['\"]?on['\"]?\s*:.*?(?:pull_request_target|workflow_run|issue_comment)",
     re.MULTILINE | re.DOTALL,
 )
 # Triggers attackers can drive from a fork (broader set — covers public-repo
 # self-hosted abuse via plain `pull_request` too).
 FORK_REACHABLE_TRIGGERS_RE = re.compile(
-    r"^\s*on\s*:.*?(?:pull_request_target|pull_request|workflow_run|issue_comment|fork)",
+    r"^\s*['\"]?on['\"]?\s*:.*?(?:pull_request_target|pull_request|workflow_run|issue_comment|fork)",
     re.MULTILINE | re.DOTALL,
 )
 SELF_HOSTED_RE = re.compile(
