@@ -1,8 +1,10 @@
 import base64
+import io
 import logging
 import os
 import re
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -153,6 +155,31 @@ NEXT_STEP_RE = re.compile(
 # 2025-03-14 to 2025-03-15 UTC.
 MALICIOUS_TJ_SHA = "0e58ed8671d6b60d0890c21b07f8835ace038e67"
 CVE_2025_30066_DATE_RANGE = "2025-03-14..2025-03-15"
+# Cap log downloads to keep network/memory bounded — a single repo with 100s
+# of CVE-window runs would otherwise produce GBs of traffic.
+CVE_LOG_SCAN_RUN_CAP = 20
+
+# IoC patterns for CVE-2025-30066 log forensics.
+# A line of pure base64 longer than this is unusual in CI output but matches
+# the memory-dump signature dropped by the malicious tj-actions payload.
+LONG_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{500,}={0,2}")
+# Common secret prefixes that, when found inside a *decoded* base64 blob from
+# a workflow log, indicate the memory dump captured live credentials.
+SECRET_PREFIX_RE = re.compile(
+    rb"("
+    rb"ghp_[A-Za-z0-9]{36}"
+    rb"|ghs_[A-Za-z0-9]{36}"
+    rb"|gho_[A-Za-z0-9]{36}"
+    rb"|github_pat_[A-Za-z0-9_]{82}"
+    rb"|AKIA[0-9A-Z]{16}"
+    rb"|ASIA[0-9A-Z]{16}"
+    rb"|AIza[0-9A-Za-z_\-]{35}"
+    rb"|xox[pbaor]-[A-Za-z0-9\-]{10,}"
+    rb"|npm_[A-Za-z0-9]{36}"
+    rb"|sk-[A-Za-z0-9]{20,}"
+    rb"|glpat-[A-Za-z0-9_\-]{20,}"
+    rb")"
+)
 
 # Actions known to have been compromised in supply-chain attacks. Pinning to a
 # SHA does not save you if the SHA itself was tampered — these refs warrant a
@@ -434,6 +461,71 @@ def find_malicious_tj_pin(content):
     return findings
 
 
+def download_run_logs(owner, repo, run_id):
+    """Fetch the log archive (ZIP) for a workflow run.
+
+    Returns the raw bytes, or None if the logs are unavailable: the most
+    common reason is GitHub's 90-day retention window having lapsed (HTTP
+    410 / 404). We never write the bytes to disk — they likely contain
+    secrets and live only in memory while we scan.
+    """
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/runs/{run_id}/logs"
+    response = make_request(url)
+    if not response:
+        return None
+    return response.content
+
+
+def scan_log_archive_for_cve_iocs(zip_bytes):
+    """Inspect a workflow-run log archive for indicators of CVE-2025-30066
+    memory-dump exposure.
+
+    The malicious tj-actions/changed-files payload dumped runner process
+    memory (which contains every secret in the env) as a base64 blob into
+    the workflow log. We surface two confidence tiers:
+
+      - 'confirmed' — a decoded base64 blob in the log matches a known
+        secret prefix (ghp_, AKIA…, AIza…, xoxb-…, npm_…, etc.).
+      - 'suspicious' — a very long base64 blob whose decoded bytes don't
+        match a known prefix but is consistent with a memory dump.
+
+    Returns a list of (log_filename, severity, hint) tuples.
+    """
+    findings = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        return findings
+    try:
+        for name in zf.namelist():
+            try:
+                raw = zf.read(name)
+            except (KeyError, RuntimeError):
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            for match in LONG_BASE64_RE.finditer(text):
+                blob = match.group(0)
+                try:
+                    decoded = base64.b64decode(blob, validate=False)
+                except (ValueError, base64.binascii.Error):
+                    continue
+                secret_hit = SECRET_PREFIX_RE.search(decoded)
+                if secret_hit:
+                    token = secret_hit.group(1).decode("ascii", errors="replace")
+                    # Don't echo the whole token — just the prefix family.
+                    prefix = re.split(r"[A-Za-z0-9]{6,}", token, maxsplit=1)[0] or token[:6]
+                    findings.append((name, "confirmed", f"decoded blob contains {prefix}… credential"))
+                    break  # one hit per file is enough
+                elif len(decoded) > 4096:
+                    findings.append(
+                        (name, "suspicious", f"{len(blob)}-char base64 blob ({len(decoded)} bytes decoded)")
+                    )
+                    break
+    finally:
+        zf.close()
+    return findings
+
+
 def list_workflow_runs_in_window(owner, repo, workflow_path, date_range):
     """List runs of a specific workflow file during a date window.
 
@@ -570,15 +662,52 @@ def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=Fal
             logger.error(
                 f"[cve-2025-30066-exposed-runs] {location} -> "
                 f"{len(runs)} run(s) executed during the exposure window "
-                f"(2025-03-14..2025-03-15); inspect logs for leaked secrets"
+                f"(2025-03-14..2025-03-15); scanning logs for leaked secrets"
             )
-            for run in runs[:5]:  # cap to keep output readable
-                logger.error(
-                    f"    run #{run.get('run_number')} "
-                    f"({run.get('created_at')}) {run.get('html_url')}"
+
+            scanned = 0
+            confirmed = 0
+            suspicious = 0
+            expired = 0
+            for run in runs[:CVE_LOG_SCAN_RUN_CAP]:
+                run_id = run.get("id")
+                run_url = run.get("html_url")
+                run_number = run.get("run_number")
+                if run_id is None:
+                    continue
+                zip_bytes = download_run_logs(org_name, repo_name, run_id)
+                if zip_bytes is None:
+                    expired += 1
+                    continue
+                scanned += 1
+                iocs = scan_log_archive_for_cve_iocs(zip_bytes)
+                if not iocs:
+                    logger.info(
+                        f"    run #{run_number} {run_url} -> no IoCs in logs"
+                    )
+                    continue
+                run_confirmed = any(sev == "confirmed" for _, sev, _ in iocs)
+                if run_confirmed:
+                    confirmed += 1
+                else:
+                    suspicious += 1
+                for log_name, severity, hint in iocs:
+                    level = logger.error if severity == "confirmed" else logger.warning
+                    level(
+                        f"    [{severity}] run #{run_number} {run_url} "
+                        f"-> {log_name}: {hint}"
+                    )
+
+            remaining = len(runs) - CVE_LOG_SCAN_RUN_CAP
+            if remaining > 0:
+                logger.warning(
+                    f"    {remaining} additional run(s) NOT scanned (cap = "
+                    f"{CVE_LOG_SCAN_RUN_CAP}); review manually at the workflow URL"
                 )
-            if len(runs) > 5:
-                logger.error(f"    … and {len(runs) - 5} more")
+            logger.info(
+                f"    summary: scanned={scanned} confirmed={confirmed} "
+                f"suspicious={suspicious} expired-or-unreadable={expired}"
+            )
 
     if find_secrets_inherit(content):
         logger.warning(
