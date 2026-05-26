@@ -34,6 +34,11 @@ cd insecureactions
 pip install .
 ```
 
+> pipx:
+```
+pipx install git+https://github.com/deeplooklabs/insecureactions.git
+```
+
 ### Usage
 ```bash
 insecureactions TARGET [TARGET ...]
