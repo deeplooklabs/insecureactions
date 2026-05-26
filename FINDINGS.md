@@ -415,9 +415,20 @@ runner-memory dump — investigate the log manually.
 fetched into memory only and never written to disk by the scanner.
 
 **Caveats:**
-- GitHub retains workflow logs for 90 days by default. The CVE window is
-  in March 2025 — most repositories will return `expired-or-unreadable`
+- GitHub retains workflow **logs** for 90 days by default. The CVE window
+  is in March 2025 — most repositories will return `expired-or-unreadable`
   unless retention was extended.
+- GitHub retains workflow-**run metadata** in the Actions API for roughly
+  **14 months**. Past that horizon the runs API simply returns 0 results
+  for the CVE window — *every* repo will look `[cve-2025-30066-clean]`
+  whether or not it was actually affected. Verified empirically: as of
+  May 2026, `netdata/netdata` returns `0` runs for any query in March 2025
+  but thousands for April 2025 onward.
+- This means the **dynamic audit for CVE-2025-30066 is effectively
+  inert after ~May 2026**. The static detectors
+  (`[compromised-action]`, `[cve-2025-30066-malicious-pin]`) are not
+  time-bound and remain useful. The scanner warns at startup when this
+  retention horizon has been crossed.
 - The scanner caps log downloads at 20 runs per workflow to avoid
   excessive bandwidth use; any extras are reported as not scanned.
 

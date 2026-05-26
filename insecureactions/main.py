@@ -34,13 +34,15 @@ def main():
         help="Also probe URLs found in workflows for hijack risk (slow)",
     )
     parser.add_argument(
+        "--audit-supply-chain",
         "--cve-2025-30066",
         action="store_true",
         dest="check_cve_tj",
         help=(
-            "For workflows that use tj-actions/changed-files, list runs that "
-            "executed during the CVE-2025-30066 exposure window "
-            "(2025-03-14..2025-03-15) so you can audit logs for leaked secrets"
+            "Audit for supply-chain compromise IoCs. Currently scans workflows "
+            "that use tj-actions/changed-files for runs in the CVE-2025-30066 "
+            "exposure window (2025-03-14..2025-03-15) and downloads run logs "
+            "to search for leaked secrets. --cve-2025-30066 is kept as an alias."
         ),
     )
     parser.add_argument(

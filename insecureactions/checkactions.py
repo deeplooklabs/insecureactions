@@ -6,6 +6,7 @@ import re
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import requests
 from colorama import Fore, init
@@ -804,6 +805,23 @@ def check(targets, check_links=False, check_cve_tj=False, workers=8):
             "CVE-2025-30066 audit enabled: workflows using tj-actions/changed-files "
             "will be checked against runs in 2025-03-14..2025-03-15"
         )
+        # GitHub's Actions API returns run metadata only for roughly the last
+        # ~14 months. After that the dynamic audit returns empty regardless of
+        # whether the repo was affected — warn so the user doesn't read silence
+        # as "clean".
+        days_since_cve = (
+            datetime.now(timezone.utc)
+            - datetime(2025, 3, 15, tzinfo=timezone.utc)
+        ).days
+        if days_since_cve > 365:
+            logger.warning(
+                f"CVE-2025-30066 occurred {days_since_cve} days ago; "
+                f"GitHub's Actions runs API retention (~14 months) likely no "
+                f"longer covers the exposure window. The dynamic audit will "
+                f"return [cve-2025-30066-clean] for every repo. Static "
+                f"detectors ([compromised-action], [cve-2025-30066-malicious-pin]) "
+                f"remain effective."
+            )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
