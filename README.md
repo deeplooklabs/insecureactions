@@ -3,7 +3,11 @@
 </p>
 
 ### Description
-`insecureactions` scans every public repository in a GitHub organization (or user account) for common security issues in GitHub Actions workflows:
+`insecureactions` scans every public repository in a GitHub organization (or user account) for common security issues in GitHub Actions workflows.
+
+Every line the scanner prints is tagged with a finding type (e.g. `[script-injection]`, `[compromised-action]`). See **[FINDINGS.md](FINDINGS.md)** for the full reference: what each tag means, severity, vulnerable patterns, and remediation.
+
+Findings covered:
 
 - **Script injection in `run:`** — untrusted `${{ github.event.* }}` expressions (PR titles/bodies, issue bodies, comments, commit messages, head_ref, …) interpolated directly into a shell command.
 - **Script injection in `actions/github-script`** — same class of untrusted-input flow, but the sink is the `script:` parameter of `actions/github-script` instead of `run:`.
