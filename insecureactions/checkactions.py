@@ -147,6 +147,13 @@ GITHUB_SCRIPT_RE = re.compile(
 NEXT_STEP_RE = re.compile(
     r"^\s*-\s+(?:uses|name|run|id)\s*:", re.MULTILINE
 )
+# CVE-2025-30066: tj-actions/changed-files was compromised; all version tags
+# were retroactively pointed at a malicious commit that dumped runner memory
+# (containing secrets) into the workflow log. Exposure window roughly
+# 2025-03-14 to 2025-03-15 UTC.
+MALICIOUS_TJ_SHA = "0e58ed8671d6b60d0890c21b07f8835ace038e67"
+CVE_2025_30066_DATE_RANGE = "2025-03-14..2025-03-15"
+
 # Actions known to have been compromised in supply-chain attacks. Pinning to a
 # SHA does not save you if the SHA itself was tampered — these refs warrant a
 # louder warning regardless of how they are pinned.
@@ -214,17 +221,25 @@ def make_request(url, params=None, method="get"):
     return response
 
 
-def _paginate(url, params):
-    """Paginate any GitHub list endpoint via the Link header."""
+def _paginate(url, params, key=None):
+    """Paginate any GitHub list endpoint via the Link header.
+
+    Some endpoints (e.g. Actions runs) wrap results in a top-level key; pass
+    `key=` to extract the embedded array.
+    """
     results = []
     while url:
         response = make_request(url, params=params)
         if not response:
             break
         payload = response.json()
-        if not isinstance(payload, list):
-            break
-        results.extend(payload)
+        if key is not None and isinstance(payload, dict):
+            items = payload.get(key, [])
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
+        results.extend(items)
         params = None  # next link already encodes pagination
         url = response.links.get("next", {}).get("url")
     return results
@@ -405,6 +420,34 @@ def find_outdated_first_party(content):
     return [f"actions/checkout@{m.group(1)}" for m in OUTDATED_CHECKOUT_RE.finditer(content)]
 
 
+def find_malicious_tj_pin(content):
+    """A direct pin to the CVE-2025-30066 malicious commit SHA — definitive
+    evidence the workflow currently invokes the compromised payload."""
+    findings = []
+    for m in USES_RE.finditer(content):
+        ref = m.group(1)
+        if "@" not in ref:
+            continue
+        action, version = ref.rsplit("@", 1)
+        if action == "tj-actions/changed-files" and version.lower() == MALICIOUS_TJ_SHA:
+            findings.append(ref)
+    return findings
+
+
+def list_workflow_runs_in_window(owner, repo, workflow_path, date_range):
+    """List runs of a specific workflow file during a date window.
+
+    GitHub's API accepts `created=YYYY-MM-DD..YYYY-MM-DD` for inclusive ranges.
+    """
+    filename = workflow_path.rsplit("/", 1)[-1]
+    url = (
+        f"{GITHUB_API}/repos/{owner}/{repo}/actions/workflows/"
+        f"{filename}/runs"
+    )
+    params = {"created": date_range, "per_page": 100}
+    return _paginate(url, params, key="workflow_runs")
+
+
 def find_compromised_actions(content):
     """Match references against a curated blocklist of actions involved in
     public supply-chain incidents."""
@@ -457,12 +500,19 @@ def check_broken_links(content):
     return broken
 
 
-def scan_workflow(org_name, repo_name, path, check_links=False):
+def scan_workflow(org_name, repo_name, path, check_links=False, check_cve_tj=False):
     content = fetch_file(org_name, repo_name, path)
     if content is None:
         return
 
     location = f"{org_name}/{repo_name}:{path}"
+
+    for ref in find_malicious_tj_pin(content):
+        logger.error(
+            f"[cve-2025-30066-malicious-pin] {location} -> {ref} "
+            f"(direct pin to the malicious commit; secrets in any run that "
+            f"executed this step are compromised)"
+        )
 
     for expr in find_script_injections(content):
         logger.warning(f"[script-injection] {location} -> {expr}")
@@ -503,8 +553,32 @@ def scan_workflow(org_name, repo_name, path, check_links=False):
     for ref in find_outdated_first_party(content):
         logger.warning(f"[outdated-action] {location} -> {ref}")
 
-    for ref, reason in find_compromised_actions(content):
+    compromised_refs = find_compromised_actions(content)
+    for ref, reason in compromised_refs:
         logger.error(f"[compromised-action] {location} -> {ref} ({reason})")
+
+    # CVE-2025-30066 dynamic audit: list runs of this workflow during the
+    # exposure window. Any run that executed during that window with this
+    # action present likely leaked secrets to the workflow log.
+    if check_cve_tj and any(
+        ref.startswith("tj-actions/changed-files") for ref, _ in compromised_refs
+    ):
+        runs = list_workflow_runs_in_window(
+            org_name, repo_name, path, CVE_2025_30066_DATE_RANGE
+        )
+        if runs:
+            logger.error(
+                f"[cve-2025-30066-exposed-runs] {location} -> "
+                f"{len(runs)} run(s) executed during the exposure window "
+                f"(2025-03-14..2025-03-15); inspect logs for leaked secrets"
+            )
+            for run in runs[:5]:  # cap to keep output readable
+                logger.error(
+                    f"    run #{run.get('run_number')} "
+                    f"({run.get('created_at')}) {run.get('html_url')}"
+                )
+            if len(runs) > 5:
+                logger.error(f"    … and {len(runs) - 5} more")
 
     if find_secrets_inherit(content):
         logger.warning(
@@ -523,7 +597,7 @@ def scan_workflow(org_name, repo_name, path, check_links=False):
             logger.warning(f"[broken-link] {location} -> {link} ({status})")
 
 
-def scan_repository(repo, check_links=False):
+def scan_repository(repo, check_links=False, check_cve_tj=False):
     owner = repo.get("owner", {}).get("login")
     repo_name = repo.get("name")
     default_branch = repo.get("default_branch") or "main"
@@ -536,7 +610,13 @@ def scan_repository(repo, check_links=False):
         return
     logger.info(f"Scanning {owner}/{repo_name} ({len(paths)} workflow file(s))")
     for path in paths:
-        scan_workflow(owner, repo_name, path, check_links=check_links)
+        scan_workflow(
+            owner,
+            repo_name,
+            path,
+            check_links=check_links,
+            check_cve_tj=check_cve_tj,
+        )
 
 
 def _resolve_targets(targets):
@@ -566,7 +646,7 @@ def _resolve_targets(targets):
     return repos
 
 
-def check(targets, check_links=False, workers=8):
+def check(targets, check_links=False, check_cve_tj=False, workers=8):
     if not GITHUB_TOKEN:
         logger.error("GITHUB_ACCESS_TOKEN is not set. Aborting.")
         return
@@ -580,10 +660,15 @@ def check(targets, check_links=False, workers=8):
         return
 
     logger.info(f"Total repositories to scan: {len(repositories)}")
+    if check_cve_tj:
+        logger.info(
+            "CVE-2025-30066 audit enabled: workflows using tj-actions/changed-files "
+            "will be checked against runs in 2025-03-14..2025-03-15"
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(scan_repository, repo, check_links)
+            pool.submit(scan_repository, repo, check_links, check_cve_tj)
             for repo in repositories
         ]
         for future in as_completed(futures):

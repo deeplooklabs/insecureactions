@@ -34,6 +34,16 @@ def main():
         help="Also probe URLs found in workflows for hijack risk (slow)",
     )
     parser.add_argument(
+        "--cve-2025-30066",
+        action="store_true",
+        dest="check_cve_tj",
+        help=(
+            "For workflows that use tj-actions/changed-files, list runs that "
+            "executed during the CVE-2025-30066 exposure window "
+            "(2025-03-14..2025-03-15) so you can audit logs for leaked secrets"
+        ),
+    )
+    parser.add_argument(
         "-w",
         "--workers",
         type=int,
@@ -43,7 +53,12 @@ def main():
 
     args = parser.parse_args()
     try:
-        check(args.targets, check_links=args.check_links, workers=args.workers)
+        check(
+            args.targets,
+            check_links=args.check_links,
+            check_cve_tj=args.check_cve_tj,
+            workers=args.workers,
+        )
     except KeyboardInterrupt:
         sys.exit(130)
 

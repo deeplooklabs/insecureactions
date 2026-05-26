@@ -14,6 +14,8 @@
 - **Pipe-to-shell from URL** — `curl … | bash`, `wget … | sh` inside `run:` blocks.
 - **Outdated first-party actions** — `actions/checkout@v1` (token leak), `@v2`/`@v3` (deprecated Node 12/16 runtimes).
 - **Known-compromised actions** — blocklist for `tj-actions/changed-files`, `reviewdog/*` (CVE-2025-30066, Mar 2025) and similar supply-chain incidents.
+- **CVE-2025-30066 malicious pin** — direct reference to the compromised `tj-actions/changed-files` commit SHA (`0e58ed8…`). Smoking-gun finding.
+- **CVE-2025-30066 dynamic audit** *(opt-in via `--cve-2025-30066`)* — for workflows using `tj-actions/changed-files`, queries the runs API for executions during the exposure window (`2025-03-14..2025-03-15`). Each hit means secrets were potentially dumped into the workflow log and must be rotated.
 - **`secrets: inherit`** on reusable workflow calls — passes every caller secret to the called workflow.
 - **Unpinned third-party actions** — `uses:` references to non-first-party actions pinned to a tag or branch instead of a full commit SHA.
 - **Broken-link hijack risk** — optional probe of URLs found in workflow files.
@@ -50,8 +52,10 @@ Each `TARGET` can be:
 
 Flags:
 ```
---check-links     Also probe URLs for hijack risk (slow)
--w, --workers N   Concurrent repository scanners (default: 8)
+--check-links       Also probe URLs for hijack risk (slow)
+--cve-2025-30066    Audit runs of tj-actions/changed-files during the
+                    CVE exposure window (2025-03-14..2025-03-15)
+-w, --workers N     Concurrent repository scanners (default: 8)
 ```
 
 Examples:
